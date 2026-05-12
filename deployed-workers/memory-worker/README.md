@@ -12,33 +12,28 @@ Reconstructed from the deployed bundle on 2026-05-11. The original source repo f
 
 2. **`scheduled()` handler** — new cron entrypoint that runs `healGaps(env)` daily and writes a `cron:auto_heal` row to `session_state`. Failures log to `error_log`. Paired with `crons = ["0 13 * * *"]` in `wrangler.toml` (13:00 UTC ≈ 8am Central).
 
-3. **`/corpus/*` routes** — hybrid (FTS + vector) search over case PDFs backed by BigQuery (`authorityandbrand-workspace.legal_case.corpus_chunks`). Routes:
-   - `GET /corpus/search?q=&top=20&mode=hybrid|fts|vector` — search excerpts
+3. **`/corpus/*` routes** — full-text search over case PDFs backed by BigQuery (`authorityandbrand-workspace.legal_case.corpus_chunks` + `corpus_documents`, BQ `SEARCH()` index). Routes:
+   - `GET /corpus/search?q=&top=20` — search excerpts; `@q` accepts BQ search syntax (quoted phrases, AND/OR, field qualifiers)
    - `POST /corpus/audit  {violation_id}` — every excerpt supporting a violation
-   - `POST /corpus/ingest {r2_key|doc_id, force?}` — queue a doc for chunk+embed
-   - `GET /corpus/status` — counts of docs/chunks, embedding progress
-   - All proxy through the `GWS_WORKER` service binding (gws-worker holds the BQ credentials).
+   - `POST /corpus/ingest {r2_key|doc_id, force?}` — queue a doc for text extraction + chunking
+   - `GET /corpus/status` — counts of docs/chunks, extraction progress
+   - All proxy through the `GWS_WORKER` service binding (gws-worker holds the BQ credentials). No embeddings, no vector index — `SEARCH()` only.
 
 ## Corpus layer (BigQuery)
 
-Today: 10,000 docs in `d1_r2_document_registry` (9,912 PDFs), **zero vectorized**. The `vectorized` / `embedding_status` columns are stubbed but unused. The new `corpus_documents` + `corpus_chunks` tables close that gap.
+Today: 10,000 docs in `d1_r2_document_registry` (9,912 PDFs), with only ~333 having extracted text in `d1_knowledge_articles`. The new `corpus_documents` + `corpus_chunks` tables centralize text + search; the search index is BQ `SEARCH()` (tokenized full-text with stemming). No embeddings — kept deliberately simple.
 
 **Bootstrap** (one-time, run from `bq/` in this directory):
 
 ```bash
-# 1. Create Vertex AI connection (Cloud Console or bq CLI)
-bq mk --connection --location=us --connection_type=CLOUD_RESOURCE \
-   --project_id=authorityandbrand-workspace vertex_ai
-# Grant the connection's service-account roles/aiplatform.user
-
-# 2. Create schema + remote model
+# 1. Create schema + SEARCH index
 bq query --use_legacy_sql=false < bq/01_schema.sql
 
-# 3. Seed corpus_documents from d1_r2_document_registry + chunk known text
+# 2. Seed corpus_documents from d1_r2_document_registry + chunk known text
 bq query --use_legacy_sql=false < bq/02_backfill.sql
-
-# 4. Run section C of 02_backfill.sql in a loop until embed_status='complete'
 ```
+
+That's it. No Vertex AI connection, no remote model, no vector index.
 
 **gws-worker contract** — `/corpus/*` routes require the gws-worker to expose:
 ```
