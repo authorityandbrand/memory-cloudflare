@@ -51,6 +51,13 @@ bucket_name = "case-files"
 name = "SESSION_DO"
 class_name = "SessionStateDO"
 
+# Service binding to gws-worker — holds the Google OAuth identity used to
+# proxy BigQuery + Sheets calls. Required by /corpus/* routes.
+# gws-worker must expose POST /bq/query  { project, query, params, mode }
+[[services]]
+binding = "GWS_WORKER"
+service = "gws-worker"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionStateDO"]

@@ -136,6 +136,23 @@ export default {
         const body = await request.json().catch(() => ({}));
         return jsonResponse(await handleHook(env, event, body), 200, corsHeaders);
       }
+      if (path === "/corpus/search" && method === "GET") {
+        const q = url.searchParams.get("q") || "";
+        const top = parseInt(url.searchParams.get("top") || "20");
+        const mode = url.searchParams.get("mode") || "hybrid";
+        return jsonResponse(await corpusSearch(env, q, top, mode), 200, corsHeaders);
+      }
+      if (path === "/corpus/audit" && method === "POST") {
+        const body = await request.json();
+        return jsonResponse(await corpusAudit(env, body.violation_id), 200, corsHeaders);
+      }
+      if (path === "/corpus/ingest" && method === "POST") {
+        const body = await request.json();
+        return jsonResponse(await corpusIngest(env, body), 200, corsHeaders);
+      }
+      if (path === "/corpus/status" && method === "GET") {
+        return jsonResponse(await corpusStatus(env), 200, corsHeaders);
+      }
       if (path.startsWith("/session/")) {
         const sessionId = path.split("/session/")[1].split("/")[0];
         const subPath = "/" + (path.split("/session/")[1].split("/").slice(1).join("/") || "load");
@@ -161,7 +178,11 @@ export default {
         "POST /memory/compact",
         "GET /memory/resume",
         "POST /memory/hook/:event",
-        "GET|POST /session/:id/load|save|checkpoint|event"
+        "GET|POST /session/:id/load|save|checkpoint|event",
+        "GET /corpus/search?q=&top=&mode=hybrid|fts|vector",
+        "POST /corpus/audit  body:{violation_id}",
+        "POST /corpus/ingest body:{r2_key} or {doc_id}",
+        "GET /corpus/status"
       ] }, 404, corsHeaders);
     } catch (err) {
       return jsonResponse({ error: err.message, stack: err.stack }, 500, corsHeaders);
@@ -491,4 +512,145 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
     status,
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...extraHeaders }
   });
+}
+
+// ============================================================================
+// Corpus layer — hybrid (FTS + vector) search over case PDFs in BigQuery.
+// ============================================================================
+
+const BQ_PROJECT = "authorityandbrand-workspace";
+const BQ_DATASET = "legal_case";
+
+// bqQuery: proxy a parameterized SQL query through gws-worker (which holds the
+// Google OAuth identity authorized for BigQuery). The service binding contract:
+//   POST /bq/query  { project, query, params, mode: "read"|"write" }
+//   -> { rows: [...], schema: [...] }
+async function bqQuery(env, sql, params = {}, mode = "read") {
+  if (!env.GWS_WORKER) {
+    throw new Error("GWS_WORKER service binding missing; cannot reach BigQuery");
+  }
+  const req = new Request("https://gws-worker.internal/bq/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: BQ_PROJECT, query: sql, params, mode })
+  });
+  const res = await env.GWS_WORKER.fetch(req);
+  if (!res.ok) throw new Error(`BQ proxy ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+async function corpusSearch(env, q, top, mode) {
+  if (!q) return { results: [], query: "" };
+  const dataset = `${BQ_PROJECT}.${BQ_DATASET}`;
+
+  if (mode === "fts") {
+    const sql = `
+      SELECT chunk_id, doc_id, r2_key, page, text
+      FROM \`${dataset}.corpus_chunks\`
+      WHERE SEARCH(text, @q)
+      LIMIT @top
+    `;
+    const { rows } = await bqQuery(env, sql, { q, top });
+    return { mode, query: q, result_count: rows.length, results: rows };
+  }
+
+  if (mode === "vector") {
+    const sql = `
+      SELECT base.chunk_id, base.doc_id, base.r2_key, base.page, base.text, distance
+      FROM VECTOR_SEARCH(
+        TABLE \`${dataset}.corpus_chunks\`, 'embedding',
+        (SELECT ml_generate_embedding_result AS embedding FROM ML.GENERATE_EMBEDDING(
+           MODEL \`${dataset}.text_embedding_005\`,
+           (SELECT @q AS content),
+           STRUCT(TRUE AS flatten_json_output))),
+        top_k => @top, distance_type => 'COSINE')
+    `;
+    const { rows } = await bqQuery(env, sql, { q, top });
+    return { mode, query: q, result_count: rows.length, results: rows };
+  }
+
+  // hybrid (default) — FTS + vector union with reciprocal-rank fusion.
+  const sql = `
+    WITH q_embed AS (
+      SELECT ml_generate_embedding_result AS embedding
+      FROM ML.GENERATE_EMBEDDING(
+        MODEL \`${dataset}.text_embedding_005\`,
+        (SELECT @q AS content),
+        STRUCT(TRUE AS flatten_json_output))
+    ),
+    fts AS (
+      SELECT chunk_id, doc_id, r2_key, page, text,
+             1.0 AS fts_score, CAST(NULL AS FLOAT64) AS vec_distance
+      FROM \`${dataset}.corpus_chunks\`
+      WHERE SEARCH(text, @q)
+      LIMIT 100
+    ),
+    vec AS (
+      SELECT base.chunk_id, base.doc_id, base.r2_key, base.page, base.text,
+             CAST(NULL AS FLOAT64) AS fts_score, distance AS vec_distance
+      FROM VECTOR_SEARCH(
+        TABLE \`${dataset}.corpus_chunks\`, 'embedding',
+        TABLE q_embed, top_k => 100, distance_type => 'COSINE')
+    )
+    SELECT chunk_id, doc_id, r2_key, page, text,
+           MAX(fts_score) AS fts_score, MIN(vec_distance) AS vec_distance,
+           (CASE WHEN MAX(fts_score) IS NOT NULL THEN 1.0/60 ELSE 0 END
+            + CASE WHEN MIN(vec_distance) IS NOT NULL
+                   THEN 1.0/(60 + RANK() OVER (ORDER BY MIN(vec_distance) ASC NULLS LAST))
+                   ELSE 0 END) AS hybrid_score
+    FROM (SELECT * FROM fts UNION ALL SELECT * FROM vec)
+    GROUP BY chunk_id, doc_id, r2_key, page, text
+    ORDER BY hybrid_score DESC
+    LIMIT @top
+  `;
+  const { rows } = await bqQuery(env, sql, { q, top });
+  return { mode: "hybrid", query: q, result_count: rows.length, results: rows };
+}
+
+async function corpusAudit(env, violation_id) {
+  if (!violation_id) return { error: "violation_id required" };
+  const dataset = `${BQ_PROJECT}.${BQ_DATASET}`;
+  const sql = `
+    SELECT v.id AS violation_id, v.violation_type,
+           c.chunk_id, c.doc_id, c.r2_key, c.page, d.cite_as, c.text
+    FROM \`${dataset}.d1_violation_matrix\` v
+    JOIN \`${dataset}.d1_document_violation_links\` link ON link.violation_id = v.id
+    JOIN \`${dataset}.corpus_documents\` d
+      ON d.r2_key = link.document_r2_key OR d.title = link.document_title
+    JOIN \`${dataset}.corpus_chunks\` c ON c.doc_id = d.doc_id
+    WHERE v.id = @violation_id
+  `;
+  const { rows } = await bqQuery(env, sql, { violation_id });
+  return { violation_id, excerpt_count: rows.length, excerpts: rows };
+}
+
+async function corpusIngest(env, body) {
+  // Enqueue a document for chunk + embed. Heavy lifting (OCR, chunking, embed)
+  // runs in gws-worker / a dedicated pipeline; this endpoint just records intent.
+  const { r2_key, doc_id, force = false } = body;
+  if (!r2_key && !doc_id) return { error: "r2_key or doc_id required" };
+  const dataset = `${BQ_PROJECT}.${BQ_DATASET}`;
+  const sql = `
+    UPDATE \`${dataset}.corpus_documents\`
+    SET text_status = IF(@force, 'pending', text_status),
+        embed_status = IF(@force, 'pending', embed_status),
+        updated_at = CURRENT_TIMESTAMP()
+    WHERE r2_key = @r2_key OR doc_id = @doc_id
+  `;
+  await bqQuery(env, sql, { r2_key: r2_key || "", doc_id: doc_id || "", force }, "write");
+  return { queued: true, r2_key, doc_id, force };
+}
+
+async function corpusStatus(env) {
+  const dataset = `${BQ_PROJECT}.${BQ_DATASET}`;
+  const sql = `
+    SELECT
+      (SELECT COUNT(*) FROM \`${dataset}.corpus_documents\`)                                AS documents,
+      (SELECT COUNTIF(embed_status='complete') FROM \`${dataset}.corpus_documents\`)        AS embedded_docs,
+      (SELECT COUNTIF(embed_status='pending')  FROM \`${dataset}.corpus_documents\`)        AS pending_docs,
+      (SELECT COUNT(*) FROM \`${dataset}.corpus_chunks\`)                                   AS chunks,
+      (SELECT COUNTIF(embedding IS NULL) FROM \`${dataset}.corpus_chunks\`)                 AS chunks_missing_embedding
+  `;
+  const { rows } = await bqQuery(env, sql);
+  return rows[0] || {};
 }
