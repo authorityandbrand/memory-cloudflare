@@ -1,0 +1,71 @@
+name = "memory-worker"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[vars]
+CASE_NAME = "Nguyen v. Fay Servicing"
+CASE_NUMBER = "4:25-cv-00952-ALM-BD"
+COURT = "E.D. Texas"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nguyen-case"
+database_id = "e56e6c3d-13ac-4932-82e5-b98ff8e781d9"
+
+[[kv_namespaces]]
+binding = "KV_AGENT_STATE"
+id = "1d159eacce3449128aa88d6c073d06cb"
+
+[[kv_namespaces]]
+binding = "KV_BOOTSTRAP"
+id = "8fb95f94bc5b449a87e041c819764cc4"
+
+[[kv_namespaces]]
+binding = "KV_BRAIN"
+id = "5411c260559e4b168d6154915fac670f"
+
+[[kv_namespaces]]
+binding = "KV_MATRICES"
+id = "8661e7a593a74b748754a2e3adab7c9c"
+
+[[kv_namespaces]]
+binding = "KV_SESSIONS"
+id = "79ae39d205a74b089a7b8c5d563d06ec"
+
+[[r2_buckets]]
+binding = "R2_STORE"
+bucket_name = "case-files"
+
+[[durable_objects.bindings]]
+name = "SESSION_DO"
+class_name = "SessionStateDO"
+
+# Service binding to gws-worker — holds the Google OAuth identity used to
+# proxy BigQuery + Sheets calls. Required by /corpus/* routes.
+# gws-worker must expose POST /bq/query  { project, query, params, mode }
+[[services]]
+binding = "GWS_WORKER"
+service = "gws-worker"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionStateDO"]
+
+[triggers]
+crons = ["0 13 * * *"]
+
+# Secrets (set via `wrangler secret put <NAME>`):
+#   ANTHROPIC_API_KEY, API_KEY, CF_ACCOUNT_ID, CLOUDFLARE_API_TOKEN,
+#   D1_LEGAL_KB_ID, D1_NGUYEN_ID, DRIVE_CASE_FOLDER_ID,
+#   KV_BOOTSTRAP_ID, KV_CACHE_ID, NLM_PRIMARY_NOTEBOOK_ID
