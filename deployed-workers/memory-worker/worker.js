@@ -409,11 +409,22 @@ async function loadSession(env, date) {
 async function logError(env, data) {
   const today = new Date().toISOString().split("T")[0];
   const timestamp = new Date().toISOString();
+  // error_log.error_level has CHECK constraint: CRITICAL|HIGH|MEDIUM|LOW.
+  // Normalize friendly inputs (INFO, WARN, ERROR, debug) so callers don't trip the check.
+  const LEVELS = { CRITICAL: 1, HIGH: 1, MEDIUM: 1, LOW: 1 };
+  const ALIAS  = { INFO: "LOW", DEBUG: "LOW", WARN: "MEDIUM", WARNING: "MEDIUM", ERROR: "HIGH", FATAL: "CRITICAL" };
+  const raw = (data.level || "MEDIUM").toString().toUpperCase();
+  const level = LEVELS[raw] ? raw : (ALIAS[raw] || "MEDIUM");
+  // fix_result has CHECK: FIXED|RETRY|ESCALATED|OPEN.
+  const RESULTS = { FIXED: 1, RETRY: 1, ESCALATED: 1, OPEN: 1 };
+  const RESULT_ALIAS = { RESOLVED: "FIXED", DONE: "FIXED", PENDING: "OPEN" };
+  const rawStatus = (data.status || "OPEN").toString().toUpperCase();
+  const status = RESULTS[rawStatus] ? rawStatus : (RESULT_ALIAS[rawStatus] || "OPEN");
   await env.DB.prepare(`
     INSERT INTO error_log (session_date, error_level, bottleneck_id, error_source, error_message, fix_attempted, fix_result, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(today, data.level || "MEDIUM", data.bottleneck_id || null, data.source || "memory-worker", data.message || "Unknown error", data.fix || null, data.status || "OPEN", timestamp).run();
-  return { logged: true, timestamp };
+  `).bind(today, level, data.bottleneck_id || null, data.source || "memory-worker", data.message || "Unknown error", data.fix || null, status, timestamp).run();
+  return { logged: true, timestamp, level, status };
 }
 
 async function searchMemory(env, query, limit) {
